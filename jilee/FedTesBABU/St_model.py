@@ -280,99 +280,111 @@ class TESNet_Stiefel(nn.Module):
 
 
 class StiefelManifoldOptimizer(optim.Optimizer):
-    """
-    Stiefel manifold optimizer using pymanopt for projection and retraction.
-    Follows the same pattern as GrassmannManifoldOptimizer in Gr_model_with_cluster_cost.py.
-
-    Prototype param shape: (k*p, n, 1, 1) where
-        k = num_classes, p = prototype_per_class, n = feature_dim.
-    Internally reshaped to (k, n, p) for per-class Stiefel updates on St(n, p).
-    """
     def __init__(self, model, optimizer_specs, prototype_per_class):
         self.model = model
-
+        
+        # [cite_start]Handle DataParallel [cite: 145]
         if hasattr(model, 'module'):
             self.actual_model = model.module
         else:
-            self.actual_model = model
-
-        super(StiefelManifoldOptimizer, self).__init__(
-            self.actual_model.parameters(), defaults={})
-
+            self.actual_model = model [cite: 146]
+            
+        # Initialize base optimizer
+        super(StiefelManifoldOptimizer, self).__init__(self.actual_model.parameters(), defaults={}) 
+        
         self.prototype_per_class = prototype_per_class
-
+        
+        # Separate Adam optimizers for non-prototype parameters
         self.adam_optimizers = []
         self.proto_group = None
 
+        # [cite_start]Use name-based parameter group identification [cite: 147]
         for group in optimizer_specs:
             if group.get('name') == 'prototypes':
-                self.proto_group = group
+                self.proto_group = group # Save the prototype group [cite: 147]
             else:
                 self.adam_optimizers.append(optim.Adam(
                     group['params'],
-                    lr=group.get('lr', 0.001),
-                    weight_decay=group.get('weight_decay', 0)
+                    lr=group.get('lr', 0.001), # Add default [cite: 148]
+                    weight_decay=group.get('weight_decay', 0) # Add default [cite: 148]
                 ))
 
         if self.proto_group is None:
             print("WARNING: Prototype group not found in optimizer_specs!")
-
-        # pymanopt Stiefel(n, p) — single class manifold; we loop over classes
+        
         self.manifold = Stiefel(
-            self.actual_model.prototype_shape[1],   # n (feature_dim)
-            self.prototype_per_class                 # p (protos per class)
+            n=self.actual_model.prototype_shape[1],
+            p=self.prototype_per_class,
+            k=self.actual_model.num_classes
         )
 
     def step(self, closure=None):
         loss = None
         if closure is not None:
-            with torch.enable_grad():
+            with torch.enable_grad(): 
                 loss = closure()
 
         if self.proto_group:
-            self.update_prototype(self.proto_group['params'][0],
-                                  self.proto_group['lr'])
-
+            prototype_tensor = self.proto_group['params'][0] 
+            self.update_prototype(prototype_tensor, self.proto_group['lr']) 
+        
+        # [cite_start]Step all other optimizers [cite: 151]
         for adam_opt in self.adam_optimizers:
-            adam_opt.step()
-
+            adam_opt.step() 
+            
         return loss
 
+    # ---
+    # **MODIFICATION 2: Vectorized update_prototype (no loop)**
+    # ---
     @torch.no_grad()
     def update_prototype(self, param, lr):
         """
-        Per-class Stiefel retraction using pymanopt.
-        param: (k*p, n, 1, 1)  — the prototype_vectors nn.Parameter
+        Performs a batched Stiefel manifold update for all classes at once.
+        'param' is the full prototype tensor with shape [C, n, p].
         """
+        # Check for gradient on the whole tensor
         if param.grad is None:
             print("WARNING: Prototype tensor has no gradient. Skipping update.")
-            return
+            return    
 
         k = self.actual_model.num_classes
         n = self.actual_model.prototype_shape[1]
         p = self.prototype_per_class
+        
+        # Squeeze the 4D tensor (k*p, n, 1, 1) to (k*p, n)
+        param_squeezed = param.data.squeeze()
+        grad_squeezed = param.grad.data.squeeze()
 
-        # (k*p, n, 1, 1) → (k*p, n) → (k, p, n) → (k, n, p)
-        X = param.data.squeeze().reshape(k, p, n).permute(0, 2, 1)
-        G = param.grad.data.squeeze().reshape(k, p, n).permute(0, 2, 1)
+        # Reshape (k*p, n) to (k, p, n) and then permute to (k, n, p)
+        try:
+            param_3d = param_squeezed.reshape(k, p, n).permute(0, 2, 1)
+            grad_3d = grad_squeezed.reshape(k, p, n).permute(0, 2, 1)
+        except RuntimeError as e:
+            print(f"Error during reshape. Tensor shape: {param_squeezed.shape}, k={k}, p={p}, n={n}")
+            raise e
 
-        new_frames = torch.empty_like(X)
+        # Convert the 3D tensors to NumPy for pymanopt
+        cur_param_np = param_3d.detach().cpu().numpy()
+        cur_grad_np = grad_3d.detach().cpu().numpy()
 
-        for c in range(k):
-            Xc = X[c].detach().cpu().numpy()   # (n, p)
-            Gc = G[c].detach().cpu().numpy()    # (n, p)
+        # Perform the batched (k=C) manifold operations
+        param_grad = self.manifold.projection(cur_param_np, cur_grad_np)
+        new_param = self.manifold.retraction(cur_param_np, -lr * param_grad)
 
-            # Project Euclidean gradient onto tangent space of St(n, p)
-            Gc_riem = self.manifold.projection(Xc, Gc)
+        # --- START FIX ---
 
-            # Retract along -lr * Riemannian gradient
-            Xc_new = self.manifold.retraction(Xc, -lr * Gc_riem)
+        # Convert the 3D numpy result back to a tensor (k, n, p)
+        # Also, fix the bug from the source file: new_param_tensor -> torch.from_numpy(new_param)
+        new_param_tensor_3d = torch.from_numpy(new_param).to(param.device) 
+        
+        # Permute (k, n, p) back to (k, p, n)
+        new_param_permuted = new_param_tensor_3d.permute(0, 2, 1)
+        
+        # Reshape (k, p, n) to (k*p, n)
+        new_param_squeezed = new_param_permuted.reshape(k * p, n)
 
-            new_frames[c] = torch.from_numpy(Xc_new).to(param.device)
-
-        # (k, n, p) → (k, p, n) → (k*p, n) → (k*p, n, 1, 1)
-        param.data.copy_(
-            new_frames.permute(0, 2, 1)
-                      .reshape(k * p, n)
-                      .unsqueeze(-1).unsqueeze(-1)
-        )
+        # Unsqueeze to the original 4D shape (k*p, n, 1, 1) and copy
+        param.data.copy_(new_param_squeezed.unsqueeze(-1).unsqueeze(-1))
+        
+        # --- END FIX ---

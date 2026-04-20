@@ -369,7 +369,7 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
             for i,j in initial_joint_optimizer_lrs.items():
                 j *= 0.1**(args.epoch//40)
                 joint_optimizer_lrs[i] = j 
-        elif args.dataset == 'Stanford_cars':
+        elif args.dataset == 'Stanford_cars' or 'Stanford_dog':
             initial_joint_optimizer_lrs =  {'features': 1e-4,'add_on_layers':  3e-3,'prototype_vectors': 3e-3}
             joint_optimizer_lrs = {}
             for i,j in initial_joint_optimizer_lrs.items():

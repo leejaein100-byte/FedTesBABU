@@ -1,8 +1,9 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from util.helpers import list_of_distances
 from Gr_model_with_cluster_cost import *
-from settings_CUB import last_layer_optimizer_lr, joint_optimizer_lrs 
+from settings_CUB import joint_optimizer_lrs, last_layer_optimizer_lr
 from utils.misc import *
 from utils.utils import *
 
@@ -22,9 +23,11 @@ def temp_sharpen_np(x, axis=-1, temp=1.0):
     return x / x.sum(axis=axis, keepdims=True)
 
 def temp_sharpen(x, dim=-1, temp = 1.0, eps= 1e-8):
+
     x = x.pow(1.0 / temp)
     x = torch.clamp(x, min=eps)
     x = x / x.sum(dim=dim, keepdim=True)
+
     return x
 
 def get_input_logits(inputs, model, score_logit = True, is_logit = False, device=None):
@@ -36,7 +39,7 @@ def get_input_logits(inputs, model, score_logit = True, is_logit = False, device
     # 기존 코드가 model(inputs)[-1]을 사용했다면 아래처럼 유지
     if isinstance(out, (list, tuple)):
         if score_logit:
-            out = out[-2]
+            out = out[-1]
         else:
             out = out[0]
     out = out.detach()
@@ -106,7 +109,7 @@ class BayesianKDTrainer:
         self, teachers, inputs, method = 'mean', device=None):
         """
         teachers: iterable of nn.Module
-        returns mean teacher logits for classical KD
+        returns logits_arr (KD에 바로 넣을 타깃; 보통 확률 텐서)
         """
         if device is None:
             device = inputs.device
@@ -117,11 +120,14 @@ class BayesianKDTrainer:
         for i, teacher in enumerate(teachers):
             t = teacher.module if hasattr(teacher, 'module') else teacher
             t.eval().to(device)
-            logit_or_prob = get_input_logits(inputs, t, score_logit=self.args.score_logit, is_logit=True, device=device)  # (B, C)
+            # 필요시 is_logit=False/True를 맞춰 주세요. 아래는 확률을 받는 예시.
+            logit_or_prob = get_input_logits(inputs, t, score_logit =self.args.score_logit, is_logit=False, device=device)  # (B, C)
+            #entropy = get_entropy(logit_or_prob)
             logits[:, i, :] = logit_or_prob
+            #print('entropy of teacher models', entropy)
+        logits_arr, _ = merge_logits(logits, method=method, loss_type='KL', temp=self.temp)
+        return logits_arr 
 
-        mean_logits = logits.mean(dim=1)
-        return mean_logits
 
     def create_teacher_models_with_dirichlet(self, clients_state_list, clients, device, num_teachers=30):
         """Create teacher models using Dirichlet distribution from client models"""
@@ -195,10 +201,7 @@ class BayesianKDTrainer:
         
         if not hasattr(self.net_glob, 'module'):   #이게 맞는듯 beside_last는 Multi-gpu에 맞는 세팅이라
             self.net_glob = torch.nn.DataParallel(self.net_glob)
-        #if self.args.dataset == 'CUB':
-        #    joint_optimizer_lrs =  {'features': 3e-5,'add_on_layers': 8e-4,'prototype_vectors': 8e-4}
-        #else:
-        #    joint_optimizer_lrs = {'features':  1e-5,'add_on_layers':  2e-4,'prototype_vectors': 2e-4}
+
         optimizer_specs = beside_last(joint_optimizer_lrs, self.net_glob)
 
         # Create Grassmann optimizer
@@ -214,7 +217,8 @@ class BayesianKDTrainer:
         # Create data loader for server data
         server_dataset = MyDataset(X_server, y_server)
         server_loader = torch.utils.data.DataLoader(
-            server_dataset, batch_size=64, shuffle=True)
+            server_dataset, batch_size=64, shuffle=True
+        )
         
         # Prepare global model for training
         self.net_glob.train()
@@ -240,9 +244,9 @@ class BayesianKDTrainer:
             grassmann_optimizer.zero_grad()
            #_, _, project_max_distances= self.net_glob(batch_inputs)
             if self.args.score_logit:
-                _, _, output, _ = self.net_glob(batch_inputs)
+                _, _, output = self.net_glob(batch_inputs)
             else:
-                output, _, _, _= self.net_glob(batch_inputs)
+                output, _, _= self.net_glob(batch_inputs)
 
             #student_logits = F.softmax(project_max_distances, dim=1)
             # Compute knowledge distillation loss
@@ -278,13 +282,17 @@ class BayesianKDTrainer:
     
     def knowledge_distillation_loss(self, student_score, teacher_logits):
         """Compute knowledge distillation loss"""
-        T = self.temp
-        log_p_s = F.log_softmax(student_score / T, dim=1)
-        p_t = F.softmax(teacher_logits / T, dim=1)
-        if self.args.Tscale:
-            kd_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (T * T)
-        else:
-            kd_loss = F.kl_div(log_p_s, p_t, reduction='batchmean')
+        #ce_loss = F.cross_entropy(student_logits, soft_targets)
+        #soft_targets = F.softmax(teacher_logits / temperature, dim=1)
+
+    # 2. Get the student's soft log-probability distribution (log(Q))
+    # This is the input to the KL divergence loss.
+        #soft_pred = F.log_softmax(student_logits, dim=1)
+    # 3. Compute the KL divergence loss
+    # reduction='batchmean' averages the loss over the batch size (N).
+    # The default 'mean' would average over (N * num_classes), which is incorrect.
+        #kl_loss = F.kl_div(soft_pred, teacher_logits, reduction='batchmean')
+        ce_loss = F.cross_entropy(student_score, teacher_logits)
         projection_operator_1 = torch.unsqueeze(self.net_glob.module.prototype_vectors, dim=0)
         subspace_basis_matrix_T = torch.transpose(self.net_glob.module.prototype_vectors,1,2)
         projection_operator_2 = torch.unsqueeze(subspace_basis_matrix_T, dim = 1)
@@ -293,73 +301,30 @@ class BayesianKDTrainer:
         projection_operator = torch.matmul(projection_operator_1,projection_operator_2)#[200,128,10] [200,10,128] -> [200,128,128]
         pairwise_distance= torch.norm(projection_operator, dim = [2,3])
         subspace_sep = torch.norm(self.prototype_per_class-pairwise_distance, p=1, dim=[0,1], dtype=torch.double) / torch.sqrt(torch.tensor(2,dtype=torch.double)).cuda()
-        total_loss = kd_loss + self.hyperparam * subspace_sep
-        #print('kd_loss', kd_loss)
-        return total_loss
+        total_loss = ce_loss + self.hyperparam * subspace_sep
+        return total_loss 
 
-    def knowledge_distillation_loss_CE(self, student_score, teacher_logits):
-        """Compute knowledge distillation loss using Cross Entropy"""
-        T = self.temp
-        
-        # Generate soft targets from the teacher using the high temperature T
-        # Softmax is applied to convert teacher logits into a probability distribution
-        p_t = F.softmax(teacher_logits / T, dim=1) 
-        
-        # Compute Cross Entropy loss
-        # Note: We use the student's scaled logits (student_score / T)
-        # F.log_softmax combined with nll_loss (negative log-likelihood) calculates CE
-        log_p_s = F.log_softmax(student_score / T, dim=1)
-        
-        # Manual Cross Entropy calculation to handle soft target distribution p_t
-        ce_loss = -(p_t * log_p_s).sum(dim=1).mean()
-        
-        if self.args.Tscale:
-            # Scale by T^2 as per Hinton et al. to keep gradient magnitudes consistent
-            kd_loss = ce_loss * (T * T)
-        else:
-            kd_loss = ce_loss
-
-        projection_operator_1 = torch.unsqueeze(self.net_glob.module.prototype_vectors, dim=0)
-        subspace_basis_matrix_T = torch.transpose(self.net_glob.module.prototype_vectors,1,2)
-        projection_operator_2 = torch.unsqueeze(subspace_basis_matrix_T, dim = 1)
-        del subspace_basis_matrix_T
-
-        projection_operator = torch.matmul(projection_operator_1,projection_operator_2)#[200,128,10] [200,10,128] -> [200,128,128]
-        pairwise_distance= torch.norm(projection_operator, dim = [2,3])
-        subspace_sep = torch.norm(self.prototype_per_class-pairwise_distance, p=1, dim=[0,1], dtype=torch.double) / torch.sqrt(torch.tensor(2,dtype=torch.double)).cuda()
-        total_loss = kd_loss + self.hyperparam * subspace_sep
-
-        return kd_loss + self.hyperparam * subspace_sep
 
 def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, is_train, class_specific=True, use_l1_mask=True,
                    coefs=None, log=print):
+
     client_dataset = MyDataset(X_data, y_data)
     client_model = client_model.train()
     client_model = client_model.cuda()
-    
+
     if body_train:
-        #if args.dataset == 'CUB':
-        #    joint_optimizer_lrs =  {'features':  3e-5,'add_on_layers':  8e-4,'prototype_vectors': 8e-4}
-        #else:
-        #    joint_optimizer_lrs = {'features': 1e-5,'add_on_layers': 2e-4,'prototype_vectors': 2e-4}
         optimizer_specs = beside_last(joint_optimizer_lrs, client_model)
         train_epochs = args.SL_epochs
-        dataloader = DataLoader(
+    else:
+        optimizer_specs = last_only(last_layer_optimizer_lr, client_model)
+        train_epochs = args.fine_tune_epochs
+
+    optimizer = GrassmannManifoldOptimizer(client_model, optimizer_specs, client_model.module.prototype_per_class) 
+    dataloader = DataLoader(
         client_dataset,
         batch_size=args.local_bs,
         num_workers=4,
         pin_memory=False)
-    else:
-        optimizer_specs = last_only(last_layer_optimizer_lr, client_model)
-        train_epochs = args.fine_tune_epochs
-        dataloader = DataLoader(
-        client_dataset,
-        batch_size= 256,
-        num_workers=4,
-        pin_memory=False)
-
-    optimizer = GrassmannManifoldOptimizer(client_model, optimizer_specs, client_model.module.prototype_per_class) 
-
     cluster_cost=torch.tensor(0)
     separation_cost=torch.tensor(0)
 
@@ -375,7 +340,6 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
         n_examples = 0
         n_correct = 0
         n_batches = 0
-        total_local_ent = 0
         for i, (image, label) in enumerate(dataloader):
             image = image.cuda()
             target = label.cuda()  
@@ -383,16 +347,17 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
             client_model.module.prototype_class_identity= client_model.module.prototype_class_identity.cuda()
             grad_req = torch.enable_grad() if is_train else torch.no_grad()
             with grad_req:
-                output, cosine_max_scores, project_max_distances, project_distances = client_model(image)   #cosine min distances는 score 점수,즉 무조건 양수
-                if args.last_layer or not body_train:
-                    cross_entropy = torch.nn.functional.cross_entropy(output, target)
-                else:
-                    cross_entropy = torch.nn.functional.cross_entropy(project_max_distances, target)
+                output, cosine_max_scores, project_max_distances = client_model(image)   #cosine min distances는 score 점수,즉 무조건 양수
                 del image
+                if args.score_logit:
+                    cross_entropy = torch.nn.functional.cross_entropy(project_max_distances, target)
+                else:
+                    cross_entropy = torch.nn.functional.cross_entropy(output, target)
                 projection_operator_1 = torch.unsqueeze(client_model.module.prototype_vectors, dim=0)
                 subspace_basis_matrix_T = torch.transpose(client_model.module.prototype_vectors,1,2)
                 projection_operator_2 = torch.unsqueeze(subspace_basis_matrix_T, dim = 1)
                 del subspace_basis_matrix_T
+
                 projection_operator = torch.matmul(projection_operator_1,projection_operator_2)#[200,128,10] [200,10,128] -> [200,128,128]
                 pairwise_distance= torch.norm(projection_operator, dim = [2,3])
                 subspace_sep = torch.norm(client_model.module.prototype_per_class-pairwise_distance, p=1, dim=[0,1], dtype=torch.double) / torch.sqrt(torch.tensor(2,dtype=torch.double)).cuda()
@@ -412,9 +377,6 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
                     #print('inverted_distances', inverted_distances[0:20])
                     cluster_cost = torch.mean(-inverted_distances)
                     #print('Project max distances', project_max_distances[0,1:20])
-                    #correct_spatial = project_distances[:, target, :]
-                    #spatial_probs = F.softmax(correct_spatial, dim=-1)
-                    #local_entropy = -torch.sum(spatial_probs * torch.log(spatial_probs + 1e-8), dim=-1).mean()
                     if use_l1_mask:
                         l1_mask = 1 - torch.t(client_model.module.prototype_class_identity).cuda()
                         l1 = (client_model.module.last_layer.weight * l1_mask).norm(p=1)
@@ -424,30 +386,20 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
 
             if is_train:
                 if not class_specific:
-                    loss = coefs['crs_ent'] * cross_entropy + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
+                    loss = coefs['crs_ent'] * cross_entropy+ coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
                 else:
-                    if args.patch_div_loss:
-                        #loss = coefs['crs_ent'] * cross_entropy+ coefs['clst'] * cluster_cost+ coefs['sep'] * separation_cost + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
-                        loss =  coefs['crs_ent'] * cross_entropy + \
-                            coefs['clst'] * cluster_cost + \
-                            coefs['sep'] * separation_cost + \
-                            coefs['sub_sep'] * subspace_sep - (coefs['spatial_ent'] * local_entropy) + coefs['l1'] * l1 
-                    else:
-                        loss = coefs['crs_ent'] * cross_entropy+ coefs['clst'] * cluster_cost+ coefs['sep'] * separation_cost + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
-
+                    loss = coefs['crs_ent'] * cross_entropy+ coefs['clst'] * cluster_cost+ coefs['sep'] * separation_cost + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
+                   
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 #nomalize basis vectors
                 #client_model.module.prototype_vectors.data = F.normalize(client_model.module.prototype_vectors, p=2, dim=1).data
             
-            del cosine_max_scores
+            del cosine_max_scores, project_max_distances
             
             if epoch == train_epochs-1:
-                if args.last_layer or not body_train:
-                    _, predicted = torch.max(output.data, 1)
-                else:
-                    _, predicted = torch.max(project_max_distances.data, 1)
+                _, predicted = torch.max(output.data, 1)
                 n_examples += target.size(0)
                 n_correct += (predicted == target).sum().item()
                 n_batches += 1
@@ -455,20 +407,17 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
                 total_cluster_cost += cluster_cost.item()
                 total_subspace_sep_cost += subspace_sep.item()
                 total_separation_cost += separation_cost.item()
-                #total_local_ent += local_entropy.item()
                 total_l1 += l1.item()
                 total_loss+= loss.item()
                 del target
                 del output
                 del predicted
-                del project_max_distances
 
     log('\tclient_idx: \t{0}'.format(client_idx))
     log('\tcross ent: \t{0}'.format(total_cross_entropy / n_batches))
     log('\tcluster: \t{0}'.format(total_cluster_cost / n_batches))
     log('\torth: \t{0}'.format(total_orth_cost / n_batches))
     log('\tsubspace_sep: \t{0}'.format(total_subspace_sep_cost / n_batches))
-    #log('\tlocal entropy: \t{0}'.format(total_local_ent / n_batches))
     if class_specific:
         log('\tseparation:\t{0}'.format(total_separation_cost / n_batches))
     log('\taccu: \t\t{0}%'.format(n_correct / n_examples * 100))
@@ -485,8 +434,7 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
                         'l1':client_model.module.last_layer.weight.norm(p=1).item(),
                         'l1_loss' : (total_l1/n_batches),
                         'accu' : n_correct/n_examples,
-                        'average loss': (total_loss / n_batches),
-                        'diversity loss': (total_local_ent / n_batches)
+                        'average loss': (total_loss/ n_batches)
                         }
     else:
         result_loss = {'cross_entropy': total_cross_entropy / n_batches,
@@ -497,8 +445,8 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
                         'l1': client_model.module.last_layer.weight.norm(p=1).item(),
                         'l1_loss' : (total_l1/n_batches),
                         'accu' : n_correct/n_examples,
-                        'average loss': (total_loss / n_batches),
-                        'diversity loss': (total_local_ent / n_batches)}
+                        'average loss': (total_loss / n_batches)
+                        }
             
     return client_model, result_loss
 
@@ -514,7 +462,6 @@ def local_test_global_model(args, client_model, X_test, y_test, coefs):   #이�
     total_cluster_cost = 0
     n_correct = 0
     n_batches = 0
-    total_local_ent = 0
     test_dataset = MyDataset(X_test, y_test)
     test_loader = DataLoader(
         test_dataset,
@@ -528,14 +475,10 @@ def local_test_global_model(args, client_model, X_test, y_test, coefs):   #이�
             target = label.cuda()                  
             client_model = client_model.cuda()
             client_model.prototype_class_identity= client_model.prototype_class_identity.cuda()
-            #output, cosine_max_scores, project_max_distances, _ = client_model(image)   #cosine min distances는 score 점수,즉 무조건 양수
-            output, cosine_max_scores, project_max_distances, project_distances = client_model(image)   #cosine min distances는 score 점수,즉 무조건 양수
-            #if args.last_layer or not body_train:
+            output, cosine_max_scores, project_max_distances = client_model(image)   #cosine min distances는 score 점수,즉 무조건 양수
+            
+            del image
             cross_entropy = torch.nn.functional.cross_entropy(output, target)
-            #else:
-            #    cross_entropy = torch.nn.functional.cross_entropy(project_max_distances, target)
-            #del image
-            #cross_entropy = torch.nn.functional.cross_entropy(output, target)
             projection_operator_1 = torch.unsqueeze(client_model.prototype_vectors, dim=0)
             subspace_basis_matrix_T = torch.transpose(client_model.prototype_vectors,1,2)
             projection_operator_2 = torch.unsqueeze(subspace_basis_matrix_T, dim = 1)
@@ -558,27 +501,14 @@ def local_test_global_model(args, client_model, X_test, y_test, coefs):   #이�
             separation_cost = torch.mean(- inverted_distances_to_nontarget_prototypes)
             inverted_distances, _ = torch.max((cosine_max_scores) * prototypes_of_correct_class, dim=1)
             cluster_cost = torch.mean(-inverted_distances)
-            correct_spatial = project_distances[:, target, :]
-            spatial_probs = F.softmax(correct_spatial, dim=-1)
-            local_entropy = -torch.sum(spatial_probs * torch.log(spatial_probs + 1e-8), dim=-1).mean()
-            if args.patch_div_loss:
-                        #loss = coefs['crs_ent'] * cross_entropy+ coefs['clst'] * cluster_cost+ coefs['sep'] * separation_cost + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
-                loss =  coefs['crs_ent'] * cross_entropy + \
-                    coefs['clst'] * cluster_cost + \
-                    coefs['sep'] * separation_cost + \
-                    coefs['sub_sep'] * subspace_sep - (coefs['spatial_ent'] * local_entropy) + coefs['l1'] * l1 
-            else:
-                loss = coefs['crs_ent'] * cross_entropy+ coefs['clst'] * cluster_cost+ coefs['sep'] * separation_cost + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
-            #loss = coefs['crs_ent'] * cross_entropy +  coefs['sep'] * separation_cost +coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep +coefs['clst'] * cluster_cost                       
+
+            loss = coefs['crs_ent'] * cross_entropy +  coefs['sep'] * separation_cost +coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep +coefs['clst'] * cluster_cost                       
             del cosine_max_scores
             
             #softmax_scores = F.softmax(project_max_distances, dim=1)
             #print('Project max distances', project_max_distances[0,1:20])
             #print('Test Output logit', output[0,1:20])
-            #if args.last_layer or not body_train:
             _, predicted = torch.max(output.data, 1)
-            #else:
-            #    _, predicted = torch.max(project_max_distances.data, 1)
             n_examples += target.size(0)
             n_correct += (predicted == target).sum().item()
             n_batches += 1
@@ -586,7 +516,6 @@ def local_test_global_model(args, client_model, X_test, y_test, coefs):   #이�
             total_cluster_cost += cluster_cost.item()
             total_subspace_sep_cost += subspace_sep.item()
             total_separation_cost += separation_cost.item()
-            total_local_ent += local_entropy.item()
             total_l1 += l1.item()
             total_loss+= loss.item()
             del project_max_distances
@@ -602,8 +531,7 @@ def local_test_global_model(args, client_model, X_test, y_test, coefs):   #이�
                     'l1':client_model.last_layer.weight.norm(p=1).item(),
                     'l1_loss' : (total_l1/n_batches),
                     'accu' : n_correct/n_examples,
-                    'average loss': (total_loss/ n_batches),
-                    'diversity loss': (total_local_ent / n_batches)}
+                    'average loss': (total_loss/ n_batches)}
 
     return result_loss
 
@@ -619,7 +547,6 @@ def local_test_global_model_proto(args, client_model, X_test, y_test, coefs):   
     total_cluster_cost = 0
     n_correct = 0
     n_batches = 0
-    total_local_ent = 0
     test_dataset = MyDataset(X_test, y_test)
     test_loader = DataLoader(
         test_dataset,
@@ -633,13 +560,9 @@ def local_test_global_model_proto(args, client_model, X_test, y_test, coefs):   
             target = label.cuda()                  
             client_model = client_model.cuda()
             client_model.prototype_class_identity= client_model.prototype_class_identity.cuda()
-            output, cosine_max_scores, project_max_distances, project_distances = client_model(image)   #cosine min distances는 score 점수,즉 무조건 양수
-            #if args.last_layer or not body_train:
-            #    cross_entropy = torch.nn.functional.cross_entropy(output, target)
-            #else:
-            cross_entropy = torch.nn.functional.cross_entropy(project_max_distances, target)
+            output, cosine_max_scores, project_max_distances = client_model(image)   #cosine min distances는 score 점수,즉 무조건 양수
             del image
-            #cross_entropy = torch.nn.functional.cross_entropy(output, target)
+            cross_entropy = torch.nn.functional.cross_entropy(output, target)
             projection_operator_1 = torch.unsqueeze(client_model.prototype_vectors, dim=0)
             subspace_basis_matrix_T = torch.transpose(client_model.prototype_vectors,1,2)
             projection_operator_2 = torch.unsqueeze(subspace_basis_matrix_T, dim = 1)
@@ -662,32 +585,18 @@ def local_test_global_model_proto(args, client_model, X_test, y_test, coefs):   
             separation_cost = torch.mean(- inverted_distances_to_nontarget_prototypes)
             inverted_distances, _ = torch.max((cosine_max_scores) * prototypes_of_correct_class, dim=1)
             cluster_cost = torch.mean(-inverted_distances)
-            correct_spatial = project_distances[:, target, :]
-            spatial_probs = F.softmax(correct_spatial, dim=-1)
-            local_entropy = -torch.sum(spatial_probs * torch.log(spatial_probs + 1e-8), dim=-1).mean()
-            if args.patch_div_loss:
-                        #loss = coefs['crs_ent'] * cross_entropy+ coefs['clst'] * cluster_cost+ coefs['sep'] * separation_cost + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
-                loss =  coefs['crs_ent'] * cross_entropy + \
-                    coefs['clst'] * cluster_cost + \
-                    coefs['sep'] * separation_cost + \
-                    coefs['sub_sep'] * subspace_sep - (coefs['spatial_ent'] * local_entropy) + coefs['l1'] * l1 
-            else:
-                loss = coefs['crs_ent'] * cross_entropy+ coefs['clst'] * cluster_cost+ coefs['sep'] * separation_cost + coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep
-            #loss = coefs['crs_ent'] * cross_entropy +  coefs['sep'] * separation_cost +coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep +coefs['clst'] * cluster_cost                       
+
+            loss = coefs['crs_ent'] * cross_entropy +  coefs['sep'] * separation_cost +coefs['l1'] * l1 + coefs['sub_sep'] * subspace_sep +coefs['clst'] * cluster_cost                       
             del cosine_max_scores
             
             #softmax_scores = F.softmax(project_max_distances, dim=1)
             #print('Project max distances', project_max_distances[0,1:20])
             #print('Test Output logit', output[0,1:20])
-            #if args.last_layer or not body_train:
-            #    _, predicted = torch.max(output.data, 1)
-            #else:
             _, predicted = torch.max(project_max_distances.data, 1)
             n_examples += target.size(0)
             n_correct += (predicted == target).sum().item()
             n_batches += 1
             total_cross_entropy += cross_entropy.item()
-            total_local_ent += local_entropy.item()
             total_cluster_cost += cluster_cost.item()
             total_subspace_sep_cost += subspace_sep.item()
             total_separation_cost += separation_cost.item()
@@ -704,10 +613,9 @@ def local_test_global_model_proto(args, client_model, X_test, y_test, coefs):   
                     'subspace_sep_loss' : total_subspace_sep_cost / n_batches,
                     'separation_loss': total_separation_cost / n_batches,
                     'l1':client_model.last_layer.weight.norm(p=1).item(),
-                    'l1_loss' : (total_l1/n_batches),
+                    'l1_loss' : (total_l1 / n_batches),
                     'accu' : n_correct/n_examples,
-                    'average loss': (total_loss/ n_batches),
-                    'diversity loss': (total_local_ent / n_batches)}
+                    'average loss': (total_loss/ n_batches)}
 
     return result_loss
 

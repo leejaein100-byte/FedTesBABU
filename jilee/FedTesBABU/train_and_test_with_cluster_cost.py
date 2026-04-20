@@ -1,8 +1,9 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from util.helpers import list_of_distances
 from Gr_model_with_cluster_cost import *
-from settings_CUB import last_layer_optimizer_lr   #joint_optimizer_lrs, 
+from settings_CUB import joint_optimizer_lrs, last_layer_optimizer_lr
 from utils.misc import *
 from utils.utils import *
 
@@ -38,7 +39,7 @@ def get_input_logits(inputs, model, score_logit = True, is_logit = False, device
     # 기존 코드가 model(inputs)[-1]을 사용했다면 아래처럼 유지
     if isinstance(out, (list, tuple)):
         if score_logit:
-            out = out[-2]
+            out = out[-1]
         else:
             out = out[0]
     out = out.detach()
@@ -95,7 +96,8 @@ def merge_logits(
     return logits_arr, logits_cond
 
 class BayesianKDTrainer:
-    def __init__(self, args, num_classes, net_glob, prototype_per_class = 3, alpha=1.0, temp=0.6, hyperparam= -1e-6):
+    def __init__(self, args, num_classes, net_glob, prototype_per_class = 3, alpha=1.0, temp=0.6, hyperparam= -1e-6,
+                 reg_lambda=0.0):
         self.args = args
         self.num_classes = num_classes
         self.net_glob = net_glob  # Direct reference to global model
@@ -103,6 +105,65 @@ class BayesianKDTrainer:
         self.temp = temp    # Temperature for knowledge distillation
         self.prototype_per_class = prototype_per_class
         self.hyperparam = hyperparam
+        self.reg_lambda = reg_lambda   # 0 = off; >0 = anchor regularization strength
+        self.anchor_state = None       # θ* saved after FedAvg, before KD
+
+    def save_anchor(self, device=None):
+        """
+        Snapshot the current net_glob parameters as the regularization anchor θ*.
+        Call this AFTER FedAvg + prototype consensus, BEFORE KD training.
+
+        All tensors are stored on `device` so compute_anchor_loss() has no
+        CPU→GPU copies in the hot path.
+        """
+        model = self.net_glob.module if hasattr(self.net_glob, 'module') else self.net_glob
+        _dev = device if device is not None else next(model.parameters()).device
+        self.anchor_state = {
+            name: param.detach().clone().to(_dev)
+            for name, param in model.named_parameters()
+        }
+
+    def compute_anchor_loss(self):
+        """
+        Compute the anchor regularization penalty:
+
+          Euclidean params (features, add_on_layers, last_layer, …):
+            (reg_lambda / 2) * ||θ - θ*||²
+
+          prototype_vectors (Grassmann manifold):
+            (reg_lambda / 2) * ||P_θ - P_{θ*}||²_F
+            where P = θ θᵀ  (the subspace projection matrix)
+
+        The projection metric is gauge-invariant — it measures change in the
+        subspace itself, not in the choice of orthonormal basis within it.
+
+        Returns 0.0 (float) when reg_lambda == 0 or no anchor has been saved.
+        """
+        if self.anchor_state is None or self.reg_lambda == 0.0:
+            return 0.0
+
+        model = self.net_glob.module if hasattr(self.net_glob, 'module') else self.net_glob
+        reg_loss = 0.0
+
+        for name, param in model.named_parameters():
+            if name not in self.anchor_state:
+                continue
+            anchor = self.anchor_state[name]   # already on correct device
+
+            if 'prototype_vectors' in name:
+                # param shape: [num_classes * protos_per_class, feature_dim, 1, 1]
+                # squeeze spatial dims to get [N, D] (or [N, D, K] for multi-dim)
+                p  = param.squeeze()    # [num_classes * K, D]
+                p_ = anchor.squeeze()
+                # Projection matrices: P = V Vᵀ, shape [N, D, D]
+                P     = torch.matmul(p.unsqueeze(-1),   p.unsqueeze(-2))
+                P_ref = torch.matmul(p_.unsqueeze(-1),  p_.unsqueeze(-2))
+                reg_loss += (P - P_ref).pow(2).sum()
+            else:
+                diff = param - anchor
+                reg_loss += diff.pow(2).sum()
+
+        return 0.5 * self.reg_lambda * reg_loss
         
     def get_ensemble_logits(
         self, teachers, inputs, method = 'mean', device=None):
@@ -198,17 +259,14 @@ class BayesianKDTrainer:
         
         if not hasattr(self.net_glob, 'module'):   #이게 맞는듯 beside_last는 Multi-gpu에 맞는 세팅이라
             self.net_glob = torch.nn.DataParallel(self.net_glob)
-        if self.args.dataset == 'CUB':
-            joint_optimizer_lrs =  {'features':  1e-4,'add_on_layers':  2e-3,'prototype_vectors': 2e-3}
-        else:
-            joint_optimizer_lrs = {'features':  1e-5,'add_on_layers':  2e-4,'prototype_vectors': 2e-4}
+
         optimizer_specs = beside_last(joint_optimizer_lrs, self.net_glob)
 
         # Create Grassmann optimizer
         grassmann_optimizer = GrassmannManifoldOptimizer(
             self.net_glob, optimizer_specs, self.prototype_per_class)
         
-        return grassmann_optimizer 
+        return grassmann_optimizer   #, model
     
     def train_global_model_with_kd(self, teacher_models, server_data, device):
         """Train net_glob using knowledge distillation from teacher models with server data"""
@@ -251,7 +309,9 @@ class BayesianKDTrainer:
             # Compute knowledge distillation loss
             #total_loss = self.knowledge_distillation_loss(    
                 #student_logits, teacher_logits)
-            total_loss = self.knowledge_distillation_loss(output, teacher_logits)
+            kd_loss  = self.knowledge_distillation_loss(output, teacher_logits)
+            reg_loss = self.compute_anchor_loss()
+            total_loss = kd_loss + reg_loss
             _, predicted1 = torch.max(output, 1)
             _, predicted2 = torch.max(teacher_logits, 1)
             
@@ -284,10 +344,7 @@ class BayesianKDTrainer:
         T = self.temp
         log_p_s = F.log_softmax(student_score / T, dim=1)
         p_t = F.softmax(teacher_logits / T, dim=1)
-        if self.args.Tscale:
-            kd_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (T * T)
-        else:
-            kd_loss = F.kl_div(log_p_s, p_t, reduction='batchmean')
+        kd_loss = F.kl_div(log_p_s, p_t, reduction='batchmean') * (T * T)
         projection_operator_1 = torch.unsqueeze(self.net_glob.module.prototype_vectors, dim=0)
         subspace_basis_matrix_T = torch.transpose(self.net_glob.module.prototype_vectors,1,2)
         projection_operator_2 = torch.unsqueeze(subspace_basis_matrix_T, dim = 1)
@@ -297,72 +354,28 @@ class BayesianKDTrainer:
         pairwise_distance= torch.norm(projection_operator, dim = [2,3])
         subspace_sep = torch.norm(self.prototype_per_class-pairwise_distance, p=1, dim=[0,1], dtype=torch.double) / torch.sqrt(torch.tensor(2,dtype=torch.double)).cuda()
         total_loss = kd_loss + self.hyperparam * subspace_sep
-        #print('kd_loss', kd_loss)
-        return total_loss
+        return total_loss 
 
-    def knowledge_distillation_loss_CE(self, student_score, teacher_logits):
-        """Compute knowledge distillation loss using Cross Entropy"""
-        T = self.temp
-        
-        # Generate soft targets from the teacher using the high temperature T
-        # Softmax is applied to convert teacher logits into a probability distribution
-        p_t = F.softmax(teacher_logits / T, dim=1) 
-        
-        # Compute Cross Entropy loss
-        # Note: We use the student's scaled logits (student_score / T)
-        # F.log_softmax combined with nll_loss (negative log-likelihood) calculates CE
-        log_p_s = F.log_softmax(student_score / T, dim=1)
-        
-        # Manual Cross Entropy calculation to handle soft target distribution p_t
-        ce_loss = -(p_t * log_p_s).sum(dim=1).mean()
-        
-        if self.args.Tscale:
-            # Scale by T^2 as per Hinton et al. to keep gradient magnitudes consistent
-            kd_loss = ce_loss * (T * T)
-        else:
-            kd_loss = ce_loss
-
-        projection_operator_1 = torch.unsqueeze(self.net_glob.module.prototype_vectors, dim=0)
-        subspace_basis_matrix_T = torch.transpose(self.net_glob.module.prototype_vectors,1,2)
-        projection_operator_2 = torch.unsqueeze(subspace_basis_matrix_T, dim = 1)
-        del subspace_basis_matrix_T
-
-        projection_operator = torch.matmul(projection_operator_1,projection_operator_2)#[200,128,10] [200,10,128] -> [200,128,128]
-        pairwise_distance= torch.norm(projection_operator, dim = [2,3])
-        subspace_sep = torch.norm(self.prototype_per_class-pairwise_distance, p=1, dim=[0,1], dtype=torch.double) / torch.sqrt(torch.tensor(2,dtype=torch.double)).cuda()
-        total_loss = kd_loss + self.hyperparam * subspace_sep
-
-        return kd_loss + self.hyperparam * subspace_sep
 
 def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, is_train, class_specific=True, use_l1_mask=True,
                    coefs=None, log=print):
     client_dataset = MyDataset(X_data, y_data)
     client_model = client_model.train()
     client_model = client_model.cuda()
-    
+
     if body_train:
-        if args.dataset == 'CUB':
-            joint_optimizer_lrs =  {'features':  1e-4,'add_on_layers':  2e-3,'prototype_vectors': 2e-3}
-        else:
-            joint_optimizer_lrs = {'features':  1e-4,'add_on_layers':  2e-3,'prototype_vectors': 2e-3}
         optimizer_specs = beside_last(joint_optimizer_lrs, client_model)
         train_epochs = args.SL_epochs
-        dataloader = DataLoader(
+    else:
+        optimizer_specs = last_only(last_layer_optimizer_lr, client_model)
+        train_epochs = args.fine_tune_epochs
+
+    optimizer = GrassmannManifoldOptimizer(client_model, optimizer_specs, client_model.module.prototype_per_class) 
+    dataloader = DataLoader(
         client_dataset,
         batch_size=args.local_bs,
         num_workers=4,
         pin_memory=False)
-    else:
-        optimizer_specs = last_only(last_layer_optimizer_lr, client_model)
-        train_epochs = args.fine_tune_epochs
-        dataloader = DataLoader(
-        client_dataset,
-        batch_size= 256,
-        num_workers=4,
-        pin_memory=False)
-
-    optimizer = GrassmannManifoldOptimizer(client_model, optimizer_specs, client_model.module.prototype_per_class) 
-
     cluster_cost=torch.tensor(0)
     separation_cost=torch.tensor(0)
 

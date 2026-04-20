@@ -396,6 +396,7 @@ def main():
                 is_train=True, coefs=coefs, log=print)
             clients[client_idx] = clients[client_idx].module
             ft_test_results = local_test_global_model(args, clients[client_idx], X_client_test, y_client_test, coefs)
+            #client_ft_results[client_idx].append(ft_test_results['accu'])
             
             # Log to TensorBoard
             writer.add_scalar(f'FineTune/Client_{client_idx}_Accuracy', ft_test_results['accu'], global_step=fine_tune_epoch)

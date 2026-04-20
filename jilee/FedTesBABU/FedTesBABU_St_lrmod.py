@@ -1,6 +1,7 @@
 import os
 import shutil
 import json
+import gc
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import time
@@ -26,48 +27,40 @@ class MyDataset(Dataset):
         # Return a tuple of the sample and its corresponding label
         return self.X[index], self.y[index]
 
-def create_push_dataloader(args, dataset, server_idx, dict_users, device):
+def create_push_dataloader(args, lazy_dataset, dict_users, device):
     """
-    Create a dataloader for prototype pushing using training data from all clients.
+    Create a push dataloader from a lazy dataset (no giant tensor in RAM).
+    Push expects un-normalized images in [0, 1].
     """
-    all_X_train = []
-    all_y_train = []
-    
-    # Collect training data from all clients
+    dict_users_train, _ = dict_users
+    push_indices = []
     for client_idx in range(args.num_users):
-        X_train, y_train = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = True, private = True)
-        all_X_train.append(X_train)
-        all_y_train.append(y_train)
-    
-    # Combine all training data
-    combined_X = torch.cat(all_X_train, dim=0)
-    combined_y = torch.cat(all_y_train, dim=0)
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    
-    # Denormalize: x_denorm = (x_norm * std) + mean
-    combined_X_denorm = combined_X * std + mean
-    
-    # Clamp to [0, 1] range to ensure valid image data
-    #combined_X_denorm = torch.clamp(combined_X_denorm, 0.0, 1.0)    
-    # Create dataset
-    push_dataset = torch.utils.data.TensorDataset(combined_X_denorm, combined_y)
-    
-    # Create dataloader (no normalization here as push expects unnormalized data in [0,1])
-    push_dataloader = torch.utils.data.DataLoader(
-        push_dataset,
-        batch_size=args.local_bs,  # Use same batch size as training
-        shuffle=False,  # Don't shuffle for consistent prototype selection
-        num_workers=0,  # Set to 0 to avoid potential issues
-        pin_memory=True if device.type == 'cuda' else False
-    )
-    
-    return push_dataloader
+        push_indices.extend(dict_users_train.get(client_idx, []))
 
-def conduct_prototype_push(args, model, dataset, server_idx, dict_users, device, 
+    _mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    _std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    class _UnnormSubset(torch.utils.data.Dataset):
+        def __init__(self, ds, indices):
+            self.ds = ds
+            self.indices = indices
+        def __len__(self):
+            return len(self.indices)
+        def __getitem__(self, i):
+            img, label = self.ds[self.indices[i]]
+            img = img * _std + _mean          # undo normalize
+            return img, label
+
+    push_dataset = _UnnormSubset(lazy_dataset, push_indices)
+    return torch.utils.data.DataLoader(
+        push_dataset, batch_size=args.local_bs, shuffle=False,
+        num_workers=4, pin_memory=(device.type == 'cuda'),
+    )
+
+def conduct_prototype_push(args, model, lazy_dataset, dict_users, device,
                           epoch, model_dir):
 
-    push_dataloader = create_push_dataloader(args, dataset, server_idx, dict_users, device)
+    push_dataloader = create_push_dataloader(args, lazy_dataset, dict_users, device)
     
     # Set up directories for saving prototypes
     img_dir = os.path.join(model_dir, 'img')
@@ -121,6 +114,7 @@ def save_settings(args, settings_dir):
     'fine_tune_epochs': args.fine_tune_epochs,
     'alpha': args.alpha,
     'use_bbox': args.use_bbox,
+    'min_per_laebl':args.min_per_label
     #'temp': args.temp,
     #'warmup_ep':args.warmup_ep,
     #'hyperparam': args.hyperparam}
@@ -139,7 +133,7 @@ def load_model_and_push(model_path, args):
     device = torch.device(f'cuda:0')
     model_dir = os.path.dirname(model_path)
     #log, logclose = create_logger(log_filename=os.path.join(model_dir, 'push.log'))    
-    dict_users, server_idx, dataset = setup_datasets(args)
+    dict_users, server_idx, lazy_dataset = setup_datasets_lazy(args)
     dataset_name = args.dataset
     base_architecture = args.arch
     num_classes = settings_CUB_Centralized.num_classes
@@ -148,7 +142,7 @@ def load_model_and_push(model_path, args):
     prototype_shape = settings_CUB_Centralized.prototype_shape
     prototype_activation_function = settings_CUB_Centralized.prototype_activation_function
     prototype_per_class = settings_CUB_Centralized.prototype_per_class
-    
+
     # Construct model
     model = construct_TesNet(
         base_architecture=base_architecture,
@@ -161,26 +155,53 @@ def load_model_and_push(model_path, args):
         prototype_activation_function=prototype_activation_function,
         add_on_layers_type=add_on_layers_type
     )
-    
+
     # Load trained weights
-    #log(f'Loading model from {model_path}')
     model.load_state_dict(torch.load(model_path, map_location=device))
     model = model.to(device)
-    
+
     # Conduct prototype push
     conduct_prototype_push(
         args=args,
         model=model,
-        dataset=dataset,
-        server_idx=server_idx,
+        lazy_dataset=lazy_dataset,
         dict_users=dict_users,
         device=device,
-        epoch='final',  # or specify epoch number
+        epoch='final',
         model_dir=model_dir,
-        #log=log
     )
     
     #logclose()
+
+def _stream_global_test(args, model, lazy_dataset, dict_users, server_idx, coefs):
+    """Evaluate model on all clients' test data without loading everything into RAM."""
+    total_correct = 0.0
+    total_examples = 0
+    total_loss = 0.0
+    total_batches = 0
+
+    for client_idx in range(args.num_users):
+        X_te, y_te = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=False)
+        n = len(y_te)
+        if n == 0:
+            continue
+        result = local_test_global_model(args, model, X_te, y_te, coefs)
+        n_batches = max(1, (n + args.local_bs - 1) // args.local_bs)
+        total_correct += result['accu'] * n
+        total_loss += result['average loss'] * n_batches
+        total_examples += n
+        total_batches += n_batches
+        del X_te, y_te
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    if total_examples == 0:
+        return {'accu': 0.0, 'average loss': 0.0}
+    return {
+        'accu': total_correct / total_examples,
+        'average loss': total_loss / total_batches if total_batches > 0 else 0.0,
+    }
+
 def main():
     args = settings_CUB_Centralized.args
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.Device_id)
@@ -213,7 +234,7 @@ def main():
         log_directory = f"checkpoints/{str(args.iid)}/{str(dataset_name)}/'FedTes_Stiefel_lrmod'/{start_time+'tuning with interval without augmented dataset'}/"
         writer = SummaryWriter(log_dir=log_directory)    
         shutil.copy(src=os.path.join(os.getcwd(), 'settings_CUB_Centralized.py'), dst=model_dir)
-        dict_users, server_idx, dataset=setup_datasets(args)
+        dict_users, server_idx, lazy_dataset = setup_datasets_lazy(args)
         net_glob = construct_TesNet(base_architecture, dataset=dataset_name,
                                 pretrained=True, img_size=img_size,
                                 prototype_shape = prototype_shape, 
@@ -246,17 +267,6 @@ def main():
         for _ in range(args.num_users):
             clients.append(copy.deepcopy(net_glob))
         
-        # Prepare combined test data
-        X_test = []
-        y_test = []
-        for client_idx in range(args.num_users):
-            #X_train, y_train, X_temp_test, y_temp_test = load_data_random(user_datasets, client_idx)
-            X_temp_test,y_temp_test= load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= False)
-            X_test.append(X_temp_test)
-            y_test.append(y_temp_test)
-        
-        X_test = torch.cat(X_test)
-        y_test = torch.cat(y_test)
         net_glob = net_glob.to(device)
         net_glob.prototype_vectors = net_glob.prototype_vectors.to(device)
         for epoch in range(num_train_epochs):
@@ -266,15 +276,17 @@ def main():
             # Train each client
             for client_idx in range(args.num_users):
                 clients[client_idx] = torch.nn.DataParallel(clients[client_idx])
-                X_train,y_train=load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= True)
-                clients[client_idx], loss_dict = train(args, client_idx, clients[client_idx], X_train, y_train, 
+                X_train, y_train = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=True)
+                clients[client_idx], loss_dict = train(args, client_idx, clients[client_idx], X_train, y_train,
                                                     is_train=True, body_train=True, coefs=coefs, log=log)
                 clients_state_list.append(clients[client_idx].module.state_dict())
                 clients[client_idx] = clients[client_idx].module
-                X_client_test,y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= False)
+                X_client_test, y_client_test = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=False)
                 client_test_results = local_test_global_model(args, clients[client_idx], X_client_test, y_client_test, coefs)
                 log(f'Client {client_idx} test accuracy before aggregation: {client_test_results["accu"]}')
-                #log(f'Client {client_idx} loss values before aggregation: {loss_dict}')
+                del X_train, y_train, X_client_test, y_client_test
+                gc.collect()
+                torch.cuda.empty_cache()
 
             # Federated averaging of non-prototype parameters
             net_glob.load_state_dict(FedAvg(clients_state_list, net_glob.state_dict()))
@@ -314,21 +326,23 @@ def main():
                     clients_state_list[user_idx][k] = copy.deepcopy(net_glob.state_dict()[k])    
                 clients[user_idx].load_state_dict(clients_state_list[user_idx])
             
-            global_test_results = local_test_global_model(args, net_glob, X_test, y_test, coefs)  
+            global_test_results = _stream_global_test(args, net_glob, lazy_dataset, dict_users, server_idx, coefs)
             writer.add_scalar('Global/Loss', global_test_results['average loss'], global_step=epoch)
-            writer.add_scalar('Global/Accuracy', global_test_results['accu'], global_step=epoch) 
+            writer.add_scalar('Global/Accuracy', global_test_results['accu'], global_step=epoch)
             log('Global model test')
             log(global_test_results)
-            
+
             # Test individual clients on their test data
             for client_idx in range(args.num_users):
-                X_client_test, y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= False)
-                #X_train, y_train = load_data(args, dataset, server_id, client_idx, dict_users_train, train = True, private = True)
+                X_client_test, y_client_test = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=False)
                 client_test_results = local_test_global_model(args, clients[client_idx], X_client_test, y_client_test, coefs)
-                client_test_results_global_data = local_test_global_model(args, clients[client_idx], X_test, y_test, coefs)
+                client_test_results_global_data = _stream_global_test(args, clients[client_idx], lazy_dataset, dict_users, server_idx, coefs)
                 writer.add_scalar(f'Client_{client_idx}/Accuracy', client_test_results['accu'], global_step=epoch)
                 writer.add_scalar(f'Client_{client_idx}/Accuracy_glob_data', client_test_results_global_data['accu'], global_step=epoch)
                 log(f'Client {client_idx} test accuracy: {client_test_results["accu"]}')
+                del X_client_test, y_client_test
+                gc.collect()
+                torch.cuda.empty_cache()
                 if epoch == num_train_epochs -1:
                     all_local_accs_bef_FT.append(client_test_results['accu'])
 
@@ -337,23 +351,25 @@ def main():
         trial_local_final_accs = [] 
         trial_univ_local_accs = []   
         for client_idx in range(args.num_users):
-            X_train, y_train = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = True, private = True)
-            X_client_test, y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = False)
-            #X_client_test, y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = False)
+            X_train, y_train = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=True, private=True)
+            X_client_test, y_client_test = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=False)
             for fine_tune_epoch in range(args.fine_tune_epochs):
                 clients[client_idx] = torch.nn.DataParallel(clients[client_idx])
-                clients[client_idx], loss_dict = fine_tune_train(args, client_idx, clients[client_idx], X_train, y_train, 
+                clients[client_idx], loss_dict = fine_tune_train(args, client_idx, clients[client_idx], X_train, y_train,
                     is_train=True, body_train=False, coefs=coefs, log=print)
                 clients[client_idx] = clients[client_idx].module
                 ft_test_results = local_test_global_model(args, clients[client_idx], X_client_test, y_client_test, coefs)
-                
+
                 writer.add_scalar(f'FineTune/Client_{client_idx}_Accuracy', ft_test_results['accu'], global_step=fine_tune_epoch)
                 writer.add_scalar(f'FineTune/Client_{client_idx}_loss', loss_dict['average loss'], global_step=fine_tune_epoch)
                 log(f'Client {client_idx}, Fine-tune epoch {fine_tune_epoch}, accuracy: {ft_test_results["accu"]}')
                 if epoch == num_train_epochs -1:
-                    client_test_results_global_data = local_test_global_model(args, clients[client_idx], X_test, y_test, coefs)
+                    client_test_results_global_data = _stream_global_test(args, clients[client_idx], lazy_dataset, dict_users, server_idx, coefs)
                     trial_local_final_accs.append(ft_test_results['accu'])
-                    trial_univ_local_accs.append(client_test_results_global_data['accu']) 
+                    trial_univ_local_accs.append(client_test_results_global_data['accu'])
+            del X_train, y_train, X_client_test, y_client_test
+            gc.collect()
+            torch.cuda.empty_cache() 
         
         all_univ_local_accs.append(trial_univ_local_accs)
         all_local_accs.append(trial_local_final_accs)
@@ -370,8 +386,7 @@ def main():
         conduct_prototype_push(
             args=args,
             model=net_glob,
-            dataset=dataset,
-            server_idx=server_idx,
+            lazy_dataset=lazy_dataset,
             dict_users=dict_users,
             device=device,
             epoch='final',
@@ -380,12 +395,14 @@ def main():
         conduct_prototype_push(
             args=args,
             model=clients[0],
-            dataset=dataset,
-            server_idx=server_idx,
+            lazy_dataset=lazy_dataset,
             dict_users=dict_users,
             device=device,
             epoch='final',
             model_dir=os.path.join(model_dir,'clients'))
+        del lazy_dataset, dict_users, server_idx, clients, net_glob
+        gc.collect()
+        torch.cuda.empty_cache()
     
         logclose()
     gm_mean = np.mean(all_global_accs) * 100

@@ -3,13 +3,17 @@ import os
 import shutil
 import json
 # import torch.utils.data.distributed
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 import time
 import push
 from torch.utils.tensorboard import SummaryWriter
 from util.helpers import makedir
 from train_and_test_with_cluster_cost import *
 from util.log import create_logger
+from util.preprocess import mean, std, preprocess_input_function
 import settings_CUB
+#from utils.Fedtes_data_dist_img_augment import *
 from utils.Stanford_Dog_args_iid_non_iid_non_overlapping import *
 from utils.sampling import *
 from utils.utils import *
@@ -143,12 +147,10 @@ def main():
             #X_train, y_train = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = True, private = True)
             X_client_test,y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= False)
             client_test_results = local_test_global_model_proto(args, clients[client_idx], X_client_test, y_client_test, coefs)
-            client_test_results_global_data = local_test_global_model_proto(args, clients[client_idx], X_test, y_test, coefs)
             writer.add_scalar(f'Client_{client_idx}/Accuracy', client_test_results['accu'], global_step=epoch)
-            writer.add_scalar(f'Client_{client_idx}/Accuracy_glob_data', client_test_results_global_data['accu'], global_step=epoch)
-            log(f'Client {client_idx} test accuracy after aggregation global data: {client_test_results_global_data["accu"]}')
-            log(f'Client {client_idx} test accuracy after aggregation client data: {client_test_results["accu"]}')
-
+            writer.add_scalar(f'Client_{client_idx}/Loss', client_test_results['average loss'], global_step=epoch)
+            log(f'Client {client_idx} test accuracy after aggregating global model: {client_test_results["accu"]}')
+            
     log('Starting fine-tuning phase')
     client_ft_results = {}
     for client_idx in range(args.num_users):
@@ -163,6 +165,7 @@ def main():
             ft_test_results = local_test_global_model(args, clients[client_idx], X_client_test, y_client_test, coefs)
             client_ft_results[client_idx].append(ft_test_results['accu'])
             
+            # Log to TensorBoard
             writer.add_scalar(f'FineTune/Client_{client_idx}_Accuracy', ft_test_results['accu'], global_step=fine_tune_epoch)
             writer.add_scalar(f'FineTune/Client_{client_idx}_loss', loss_dict['average loss'], global_step=fine_tune_epoch)
             log(f'Client {client_idx}, Fine-tune epoch {fine_tune_epoch}, accuracy: {ft_test_results["accu"]}')

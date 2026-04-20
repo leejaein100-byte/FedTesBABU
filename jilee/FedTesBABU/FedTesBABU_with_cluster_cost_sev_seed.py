@@ -24,7 +24,7 @@ from Gr_model_with_cluster_cost import *
 from utils.misc import *
 
 
-def _stream_global_test_results(args, model, dataset, server_idx, dict_users, coefs, eval_fn):
+def _stream_global_test_results(args, model, lazy_dataset, dict_users, coefs, eval_fn):
     weighted_batch_metrics = {
         'cross_entropy': 0.0,
         'cluster_loss': 0.0,
@@ -39,8 +39,8 @@ def _stream_global_test_results(args, model, dataset, server_idx, dict_users, co
     total_correct = 0.0
 
     for client_idx in range(args.num_users):
-        X_client_test, y_client_test = load_Stan_data(
-            args, dataset, server_idx, client_idx, dict_users, train=False
+        X_client_test, y_client_test = load_Stan_data_lazy(
+            lazy_dataset, dict_users, None, client_idx, train=False
         )
         n_examples = len(y_client_test)
         if n_examples == 0:
@@ -107,7 +107,7 @@ def main():
         log_directory = f"checkpoints/{str(args.iid)}/'FedTesBABU NonCayleyT'/{start_time+'tuning with interval without augmented dataset'}/"
         writer = SummaryWriter(log_dir=log_directory)    
         shutil.copy(src=os.path.join(os.getcwd(), 'settings_CUB.py'), dst=model_dir)
-        dict_users, server_idx, dataset=setup_datasets(args)
+        dict_users, server_idx, lazy_dataset = setup_datasets_lazy(args)
         net_glob = construct_TesNet(args= args, base_architecture=base_architecture, prototype_per_class=prototype_per_class, dataset=dataset_name,
                             pretrained=True, img_size=img_size,
                             prototype_shape=prototype_shape,
@@ -153,17 +153,16 @@ def main():
             # Train each client
             for client_idx in range(args.num_users):
                 clients[client_idx] = torch.nn.DataParallel(clients[client_idx])
-                #X_train, y_train = load_data(args, dataset, server_id, client_idx, dict_users_train, train = True, private = True)
-                X_train,y_train=load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= True)
-                #X_train, y_train, X_temp_test, y_temp_test = load_data_random(user_datasets, client_idx)
-                clients[client_idx], loss_dict = train(args, client_idx, clients[client_idx], X_train, y_train, 
+                X_train, y_train = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=True)
+                clients[client_idx], loss_dict = train(args, client_idx, clients[client_idx], X_train, y_train,
                                                     is_train=True, body_train=True, coefs=coefs, log=log)
-                #return_dict[client_idx] = loss_dict
                 clients_state_list.append(clients[client_idx].module.state_dict())
                 clients[client_idx] = clients[client_idx].module
-                X_client_test,y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= False)
+                del X_train, y_train; gc.collect()
+                X_client_test, y_client_test = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=False)
                 client_test_results = local_test_global_model_proto(args, clients[client_idx], X_client_test, y_client_test, coefs)
                 log(f'Client {client_idx} test accuracy before aggregation: {client_test_results["accu"]}')
+                del X_client_test, y_client_test; gc.collect()
                 #log(f'Client {client_idx} loss values before aggregation: {loss_dict}')
 
             net_glob.load_state_dict(FedAvg(clients_state_list, net_glob.state_dict()))
@@ -201,83 +200,80 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
 
-            global_test_results = _stream_global_test_results(args, net_glob, dataset, server_idx, dict_users, coefs, local_test_global_model_proto)
+            global_test_results = _stream_global_test_results(args, net_glob, lazy_dataset, dict_users, coefs, local_test_global_model_proto)
             writer.add_scalar('Global/Loss', global_test_results['average loss'], global_step=epoch)
-            writer.add_scalar('Global/Accuracy', global_test_results['accu'], global_step=epoch) 
+            writer.add_scalar('Global/Accuracy', global_test_results['accu'], global_step=epoch)
             log('Global model test')
             log(global_test_results)
-            
+
             # Test individual clients on their test data
             for client_idx in range(args.num_users):
-                #X_train, y_train, X_client_test, y_client_test = load_data_random(user_datasets, client_idx)
-                #X_train, y_train = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = True, private = True)
-                X_client_test,y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train= False)
+                X_client_test, y_client_test = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=False)
                 client_test_results = local_test_global_model_proto(args, clients[client_idx], X_client_test, y_client_test, coefs)
-                client_test_results_global_data = _stream_global_test_results(args, clients[client_idx], dataset, server_idx, dict_users, coefs, local_test_global_model_proto)
+                client_test_results_global_data = _stream_global_test_results(args, clients[client_idx], lazy_dataset, dict_users, coefs, local_test_global_model_proto)
                 writer.add_scalar(f'Client_{client_idx}/Accuracy', client_test_results['accu'], global_step=epoch)
                 writer.add_scalar(f'Client_{client_idx}/Accuracy_glob_data', client_test_results_global_data['accu'], global_step=epoch)
                 log(f'Client {client_idx} test accuracy after aggregating global model: {client_test_results["accu"]}')
+                del X_client_test, y_client_test; gc.collect()
                 if epoch == num_train_epochs -1:
                     all_local_accs_bef_FT.append(client_test_results['accu'])
 
         all_global_accs.append(global_test_results['accu'])
         log('Starting fine-tuning phase')
-        trial_local_final_accs = [] 
-        trial_univ_local_accs = []   
+        trial_local_final_accs = []
+        trial_univ_local_accs = []
         for client_idx in range(args.num_users):
-            X_train, y_train = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = True, private = True)
-            X_client_test, y_client_test = load_Stan_data(args, dataset, server_idx, client_idx, dict_users, train = False)
+            X_train, y_train = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=True)
+            X_client_test, y_client_test = load_Stan_data_lazy(lazy_dataset, dict_users, server_idx, client_idx, train=False)
             for fine_tune_epoch in range(args.fine_tune_epochs):
                 clients[client_idx] = torch.nn.DataParallel(clients[client_idx])
-                clients[client_idx], loss_dict = fine_tune_train(args, client_idx, clients[client_idx], X_train, y_train, 
+                clients[client_idx], loss_dict = fine_tune_train(args, client_idx, clients[client_idx], X_train, y_train,
                     is_train=True, body_train=False, coefs=coefs, log=log)
                 clients[client_idx] = clients[client_idx].module
                 ft_test_results = local_test_global_model(args, clients[client_idx], X_client_test, y_client_test, coefs)
-                
+
                 # Log to TensorBoard
                 writer.add_scalar(f'FineTune/Client_{client_idx}_Accuracy', ft_test_results['accu'], global_step=fine_tune_epoch)
                 writer.add_scalar(f'FineTune/Client_{client_idx}_loss', loss_dict['average loss'], global_step=fine_tune_epoch)
                 log(f'Client {client_idx}, Fine-tune epoch {fine_tune_epoch}, accuracy: {ft_test_results["accu"]}')
-                #log(loss_dict)
                 if epoch == num_train_epochs -1:
-                    client_test_results_global_data = _stream_global_test_results(args, clients[client_idx], dataset, server_idx, dict_users, coefs, local_test_global_model)
+                    client_test_results_global_data = _stream_global_test_results(args, clients[client_idx], lazy_dataset, dict_users, coefs, local_test_global_model)
                     trial_local_final_accs.append(ft_test_results['accu'])
-                    trial_univ_local_accs.append(client_test_results_global_data['accu']) 
-        
+                    trial_univ_local_accs.append(client_test_results_global_data['accu'])
+            del X_train, y_train, X_client_test, y_client_test; gc.collect()
+
         all_univ_local_accs.append(trial_univ_local_accs)
         all_local_accs.append(trial_local_final_accs)
-        
+
         final_model_path = os.path.join(model_dir, 'final_model.pth')
         torch.save(net_glob.state_dict(), final_model_path)
         log(f'Final model saved at {final_model_path}')
-        
+
         final_client_model_path = os.path.join(model_dir, 'client_model.pth')
         torch.save(clients[0].state_dict(), final_client_model_path)
         log(f'Final model saved at {final_client_model_path}')
-        
-        # Final prototype push
-        conduct_prototype_push(
+
+        # Final prototype push (lazy)
+        conduct_prototype_push_lazy(
             args=args,
             model=net_glob,
-            dataset=dataset,
-            server_idx=server_idx,
+            lazy_dataset=lazy_dataset,
             dict_users=dict_users,
             device=device,
             epoch='final',
             model_dir=model_dir
         )
-        conduct_prototype_push(
+        conduct_prototype_push_lazy(
             args=args,
             model=clients[0],
-            dataset=dataset,
-            server_idx=server_idx,
+            lazy_dataset=lazy_dataset,
             dict_users=dict_users,
             device=device,
             epoch='final',
             model_dir=os.path.join(model_dir,'clients'))
 
         writer.close()
-        del dataset, dict_users, server_idx, clients, net_glob
+        del lazy_dataset, dict_users, server_idx, clients, net_glob
         gc.collect()
         torch.cuda.empty_cache()
         logclose()

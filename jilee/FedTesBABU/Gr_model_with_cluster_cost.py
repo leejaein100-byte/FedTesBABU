@@ -307,6 +307,7 @@ class GrassmannManifoldOptimizer(optim.Optimizer):
                 weight_decay=group.get('weight_decay', 0) # Add default
             ))
 
+                    
         self.manifold = Grassmann(self.model.module.prototype_shape[1], self.prototype_per_class)
     
     def step(self, closure=None):
@@ -346,6 +347,8 @@ class GrassmannManifoldOptimizer(optim.Optimizer):
             
             # Create Identity matrix for the batch
             I = torch.eye(n, device=param.device).unsqueeze(0).expand(C, n, n) # [C, n, n]
+            
+            # Calculate (I - P)
             I_minus_P = I - P
 
             # Calculate the two terms of Eq. 3.3: (I-P)SP + PS(I-P)

@@ -94,8 +94,7 @@ def merge_logits(
     return logits_arr, logits_cond
 
 class BayesianKDTrainer:
-    def __init__(self, args, num_classes, net_glob, prototype_per_class = 3, alpha=1.0, temp=0.6, hyperparam= -1e-6,
-                 ewc_lambda=0.0, use_fisher=False, reg_lambda_eucl=0.0, reg_lambda_proj=0.0):
+    def __init__(self, args, num_classes, net_glob, prototype_per_class = 3, alpha=1.0, temp=0.6, hyperparam= -1e-6):
         self.args = args
         self.num_classes = num_classes
         self.net_glob = net_glob  # Direct reference to global model
@@ -103,167 +102,7 @@ class BayesianKDTrainer:
         self.temp = temp    # Temperature for knowledge distillation
         self.prototype_per_class = prototype_per_class
         self.hyperparam = hyperparam
-        # EWC regularization (Fisher or plain L2, uniform across all params)
-        self.ewc_lambda = ewc_lambda       # 0 = no EWC, >0 = anchor strength
-        self.use_fisher = use_fisher       # False = simple L2, True = Fisher-weighted
-        self.anchor_state = None           # θ* saved before KD
-        self.fisher_diag = None            # F_i diagonal (only when use_fisher=True)
-        # Geometry-aware regularization with separate strengths per parameter group
-        self.reg_lambda_eucl = reg_lambda_eucl  # L2 anchor for features/add_on_layers/last_layer
-        self.reg_lambda_proj = reg_lambda_proj  # Projection-metric anchor for prototype_vectors
         
-    def save_anchor(self, server_data=None, device=None, n_fisher_samples=256):
-        """
-        Save the current net_glob parameters as the EWC anchor.
-        Call this AFTER FedAvg + Frechet mean, BEFORE KD training.
-
-        If use_fisher=True and server_data is provided, computes the diagonal
-        Fisher Information on a random subsample of the server set (n_fisher_samples).
-        Otherwise falls back to uniform weights (simple L2 anchor).
-
-        Anchor tensors and Fisher diagonals are stored directly on `device` to
-        avoid repeated CPU→GPU copies inside compute_ewc_loss().
-        """
-        model = self.net_glob.module if hasattr(self.net_glob, 'module') else self.net_glob
-        _dev = device if device is not None else next(model.parameters()).device
-        # θ* — clone every parameter onto target device once
-        self.anchor_state = {
-            name: param.detach().clone().to(_dev)
-            for name, param in model.named_parameters()
-        }
-
-        if self.use_fisher and server_data is not None:
-            self.fisher_diag = self._compute_fisher(
-                server_data, _dev, n_fisher_samples=n_fisher_samples)
-        else:
-            self.fisher_diag = None
-
-    def _compute_fisher(self, server_data, device, n_fisher_samples=256):
-        """
-        Estimate diagonal Fisher Information using empirical Fisher:
-            F_i = E[ (d log p(y|x,θ*) / dθ_i)^2 ]
-        Subsamples at most n_fisher_samples examples from the server set
-        so cost is O(n_fisher_samples) regardless of server dataset size.
-        Result tensors are stored on `device`.
-        """
-        model = self.net_glob.module if hasattr(self.net_glob, 'module') else self.net_glob
-        model.eval()
-        model.to(device)
-
-        fisher = {name: torch.zeros_like(param, device=device)
-                  for name, param in model.named_parameters()}
-
-        X_server, y_server = server_data
-        total = len(y_server)
-        if total > n_fisher_samples:
-            idx = torch.randperm(total)[:n_fisher_samples]
-            X_sub = X_server[idx]
-            y_sub = y_server[idx]
-        else:
-            X_sub, y_sub = X_server, y_server
-
-        sub_dataset = MyDataset(X_sub, y_sub)
-        sub_loader = torch.utils.data.DataLoader(
-            sub_dataset, batch_size=64, shuffle=False)
-
-        n_samples = 0
-        for batch_inputs, batch_targets in sub_loader:
-            batch_inputs = batch_inputs.to(device)
-            batch_targets = batch_targets.to(device)
-            model.zero_grad()
-
-            if self.args.score_logit:
-                _, _, output, _ = model(batch_inputs)
-            else:
-                output, _, _, _ = model(batch_inputs)
-
-            log_probs = F.log_softmax(output, dim=1)
-            loss = F.nll_loss(log_probs, batch_targets)
-            loss.backward()
-
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    fisher[name] += (param.grad.detach() ** 2) * batch_inputs.size(0)
-
-            n_samples += batch_inputs.size(0)
-
-        for name in fisher:
-            fisher[name] /= max(n_samples, 1)
-
-        model.train()
-        return fisher
-
-    def compute_ewc_loss(self):
-        """
-        Compute the EWC penalty:
-          Simple L2:  (lambda/2) * sum_i (theta_i - theta*_i)^2
-          Fisher:     (lambda/2) * sum_i F_i * (theta_i - theta*_i)^2
-        Returns 0 if no anchor is saved or ewc_lambda == 0.
-
-        anchor_state and fisher_diag are pre-placed on the model device by
-        save_anchor(), so no .to() copies happen here.
-        """
-        if self.anchor_state is None or self.ewc_lambda == 0.0:
-            return 0.0
-
-        model = self.net_glob.module if hasattr(self.net_glob, 'module') else self.net_glob
-        ewc_loss = 0.0
-        for name, param in model.named_parameters():
-            if name not in self.anchor_state:
-                continue
-            diff = param - self.anchor_state[name]   # both on same device — no copy
-            if self.use_fisher and self.fisher_diag is not None and name in self.fisher_diag:
-                ewc_loss += (self.fisher_diag[name] * diff.pow(2)).sum()
-            else:
-                ewc_loss += diff.pow(2).sum()
-
-        return 0.5 * self.ewc_lambda * ewc_loss
-
-    def compute_anchor_loss(self):
-        """
-        Geometry-aware anchor regularization with separate λ per parameter group:
-
-          Euclidean params (features, add_on_layers, last_layer, …):
-            (reg_lambda_eucl / 2) * ||θ − θ*||²
-
-          prototype_vectors (Grassmann manifold):
-            (reg_lambda_proj / 2) * ||P_θ − P_{θ*}||²_F
-            where P = θ θᵀ  (subspace projection matrix, gauge-invariant)
-
-        Either λ can be set to 0 independently to disable its group.
-        anchor_state must already be on the model device (set by save_anchor()).
-        Returns 0.0 when both lambdas are 0 or no anchor has been saved.
-        """
-        both_off = (self.reg_lambda_eucl == 0.0 and self.reg_lambda_proj == 0.0)
-        if self.anchor_state is None or both_off:
-            return 0.0
-
-        model = self.net_glob.module if hasattr(self.net_glob, 'module') else self.net_glob
-        eucl_loss = torch.tensor(0.0, device=next(model.parameters()).device)
-        proj_loss  = torch.tensor(0.0, device=next(model.parameters()).device)
-
-        for name, param in model.named_parameters():
-            if name not in self.anchor_state:
-                continue
-            anchor = self.anchor_state[name]   # already on correct device — no copy
-
-            if 'prototype_vectors' in name:
-                if self.reg_lambda_proj == 0.0:
-                    continue
-                # param shape: [N, D, 1, 1] → squeeze to [N, D]
-                p  = param.squeeze()
-                p_ = anchor.squeeze()
-                # Projection matrices P = V Vᵀ,  shape [N, D, D]
-                P     = torch.matmul(p.unsqueeze(-1),  p.unsqueeze(-2))
-                P_ref = torch.matmul(p_.unsqueeze(-1), p_.unsqueeze(-2))
-                proj_loss += (P - P_ref).pow(2).sum()
-            else:
-                if self.reg_lambda_eucl == 0.0:
-                    continue
-                eucl_loss += (param - anchor).pow(2).sum()
-
-        return 0.5 * self.reg_lambda_eucl * eucl_loss + 0.5 * self.reg_lambda_proj * proj_loss
-
     def get_ensemble_logits(self, teachers, inputs, method = 'mean', device=None):
         """
         teachers: iterable of nn.Module
@@ -373,144 +212,99 @@ class BayesianKDTrainer:
 
         return teacher_models
 
-    def setup_grassmann_optimizer(self, freeze_prototypes=False):
-        """Setup the specialized Grassmann optimizer for TESNet.
-
-        freeze_prototypes=True: set prototype_vectors LR to 0 so KD training
-        does not overwrite the Stiefel/Grassmann consensus aggregated by FedAvg.
-        Recommended when kd_epochs > 1 to prevent server-side prototype drift.
-        """
+    def setup_grassmann_optimizer(self):
+        """Setup the specialized Grassmann optimizer for TESNet"""
+        
         if not hasattr(self.net_glob, 'module'):   #이게 맞는듯 beside_last는 Multi-gpu에 맞는 세팅이라
             self.net_glob = torch.nn.DataParallel(self.net_glob)
+            joint_optimizer_lrs = {}
 
-        joint_optimizer_lrs = {}
         if self.args.dataset == 'CUB':
-            initial_joint_optimizer_lrs =  {'features': 5e-5,'add_on_layers': 15e-4,'prototype_vectors': 15e-4}
+            initial_joint_optimizer_lrs =  {'features': 5e-5,'add_on_layers':  15e-4,'prototype_vectors': 15e-4}
             for i,j in initial_joint_optimizer_lrs.items():
                 j *= 0.1**(self.args.epoch//40)
                 joint_optimizer_lrs[i] = j
-        elif self.args.dataset in ('Stanford_cars', 'Stanford_dog'):
-            initial_joint_optimizer_lrs =  {'features': 1e-4,'add_on_layers': 3e-3,'prototype_vectors': 3e-3}
+        elif self.args.dataset == 'Stanford_cars':
+            initial_joint_optimizer_lrs =  {'features': 1e-4,'add_on_layers':  3e-3,'prototype_vectors': 3e-3}
             for i,j in initial_joint_optimizer_lrs.items():
                 j *= 0.1**(self.args.epoch//30)
                 joint_optimizer_lrs[i] = j
         else:
            joint_optimizer_lrs = {'features': 1e-5,'add_on_layers':  2e-4,'prototype_vectors': 2e-4}
-
-        if freeze_prototypes:
-            joint_optimizer_lrs['prototype_vectors'] = 0.0
-
+        #initial_joint_optimizer_lrs = {'features': 5e-5,'add_on_layers':  1e-3,'prototype_vectors': 1e-3}
+        
         optimizer_specs = beside_last(joint_optimizer_lrs, self.net_glob)
 
         # Create Grassmann optimizer
         grassmann_optimizer = GrassmannManifoldOptimizer(
             self.net_glob, optimizer_specs, self.prototype_per_class)
-
-        return grassmann_optimizer
+        
+        return grassmann_optimizer   #, model
     
-    def train_global_model_with_kd(self, teacher_models, server_data, device, kd_epochs=1):
-        """Train net_glob using knowledge distillation from teacher models with server data.
-
-        The optimizer is created ONCE and reused across all kd_epochs so that
-        momentum and adaptive-rate state accumulate properly across epochs.
-
-        When kd_epochs > 1:
-        - prototype_vectors are frozen (freeze_prototypes=True) to preserve the
-          Stiefel/Grassmann consensus produced by FedAvg, preventing server-side
-          prototype drift that degrades client starting points.
-        - Cosine LR decay is applied across epochs so later epochs make smaller
-          steps, reducing total deviation from the FedAvg solution.
-        - Gradient norm clipping (max_norm=1.0) prevents runaway updates.
-        """
-        import math
+    def train_global_model_with_kd(self, teacher_models, server_data, device):
+        """Train net_glob using knowledge distillation from teacher models with server data"""
         X_server, y_server = server_data
+        
+        # Create data loader for server data
         server_dataset = MyDataset(X_server, y_server)
-
+        server_loader = torch.utils.data.DataLoader(
+            server_dataset, batch_size=64, shuffle=True)
+        
         # Prepare global model for training
         self.net_glob.train()
         self.net_glob = self.net_glob.to(device)
 
-        # Freeze prototypes when kd_epochs > 1 to prevent server-side drift
-        #freeze_proto = kd_epochs > 1
-        grassmann_optimizer = self.setup_grassmann_optimizer() #freeze_prototypes=freeze_proto
-
-        # Cache initial LRs for cosine decay.
-        # GrassmannManifoldOptimizer stores LRs in its sub-optimizers and proto_group,
-        # NOT in the inherited param_groups (which have defaults={}, i.e. no 'lr' key).
-        initial_adam_lrs = [
-            [pg['lr'] for pg in adam_opt.param_groups]
-            for adam_opt in grassmann_optimizer.adam_optimizers
-        ]
-        initial_proto_lr = (
-            grassmann_optimizer.proto_group['lr']
-            if grassmann_optimizer.proto_group is not None else None
-        )
-
+        grassmann_optimizer = self.setup_grassmann_optimizer()
+        
         total_loss_sum = 0.0
         num_batches = 0
         n_correct1 = 0
         n_correct2 = 0
         n_examples = 0
+        for batch_inputs, batch_targets in server_loader:
+            #print(f"DEBUG (train_global_model_with_kd): type(batch_inputs) is {type(batch_inputs)}")
+            batch_inputs = batch_inputs.to(device)
+            batch_targets = batch_targets.to(device)
+            
+            # Get ensemble teacher predictions
+            with torch.no_grad():
+                teacher_targets = self.get_ensemble_teacher_probs(teacher_models, batch_inputs)
+            
+            # Zero gradients
+            grassmann_optimizer.zero_grad()
+           #_, _, project_max_distances= self.net_glob(batch_inputs)
+            if self.args.score_logit:
+                _, _, output, _ = self.net_glob(batch_inputs)
+            else:
+                output, _, _, _= self.net_glob(batch_inputs)
 
-        for kd_ep in range(kd_epochs):
-            # Cosine LR decay: full LR on epoch 0, ~0 on epoch kd_epochs-1
-            #cos_factor = 0.5 * (1.0 + math.cos(math.pi * kd_ep / max(kd_epochs, 1)))
-            for adam_opt, init_lrs in zip(grassmann_optimizer.adam_optimizers, initial_adam_lrs):
-                for pg, init_lr in zip(adam_opt.param_groups, init_lrs):
-                   pg['lr'] = init_lr   #* cos_factor
-            if grassmann_optimizer.proto_group is not None and initial_proto_lr is not None:
-                grassmann_optimizer.proto_group['lr'] = initial_proto_lr   #* cos_factor
-
-            # Re-create loader each epoch so shuffle gives a different order
-            server_loader = torch.utils.data.DataLoader(
-                server_dataset, batch_size=64, shuffle=True)
-
-            for batch_inputs, batch_targets in server_loader:
-                batch_inputs = batch_inputs.to(device)
-                batch_targets = batch_targets.to(device)
-
-                # Get ensemble teacher predictions
-                with torch.no_grad():
-                    teacher_targets = self.get_ensemble_teacher_probs(teacher_models, batch_inputs)
-
-                # Zero gradients
-                grassmann_optimizer.zero_grad()
-                if self.args.score_logit:
-                    _, _, output, _ = self.net_glob(batch_inputs)
-                else:
-                    output, _, _, _ = self.net_glob(batch_inputs)
-
-                kd_loss  = self.knowledge_distillation_loss(output, teacher_targets)
-                #ewc_loss = self.compute_ewc_loss()
-                reg_loss = self.compute_anchor_loss()
-                total_loss = kd_loss  + reg_loss  #+ ewc_loss
-
-                _, predicted1 = torch.max(output, 1)
-                _, predicted2 = torch.max(teacher_targets, 1)
-
-                n_examples += batch_targets.size(0)
-                n_correct1 += (predicted1 == batch_targets).sum().item()
-                n_correct2 += (predicted2.to(device) == batch_targets).sum().item()
-
-                total_loss.backward()
-                # Gradient clipping prevents runaway updates on later kd_epochs
-                torch.nn.utils.clip_grad_norm_(
-                    [p for pg in grassmann_optimizer.param_groups for p in pg['params']
-                     if isinstance(p, torch.Tensor)],
-                    max_norm=1.0)
-                grassmann_optimizer.step()
-                total_loss_sum += total_loss.item()
-                num_batches += 1
-
+            #student_logits = F.softmax(project_max_distances, dim=1)
+            # Compute knowledge distillation loss
+            #total_loss = self.knowledge_distillation_loss(    
+                #student_logits, teacher_logits)
+            total_loss = self.knowledge_distillation_loss(output, teacher_targets)
+            _, predicted1 = torch.max(output, 1)
+            _, predicted2 = torch.max(teacher_targets, 1)
+            
+            n_examples += batch_targets.size(0)
+            n_correct1 += (predicted1 == batch_targets).sum().item()
+            n_correct2 += (predicted2.to(device) == batch_targets).sum().item()
+            # Backward pass
+            total_loss.backward()
+            
+            # Use Grassmann optimizer step
+            grassmann_optimizer.step()
+            total_loss_sum += total_loss.item()
+            num_batches += 1
+        
         # Record training results
         avg_total_loss = total_loss_sum / num_batches if num_batches > 0 else 0
-        teacher_accu = n_correct2 / n_examples if n_examples > 0 else 0
-        stu_accu = n_correct1 / n_examples if n_examples > 0 else 0
-
+        teacher_accu = n_correct2 / n_examples
+        stu_accu = n_correct1 / n_examples
         # Unwrap the model if it was wrapped
         if hasattr(self.net_glob, 'module'):
             self.net_glob = self.net_glob.module
-
+        
         return {
             'average loss': avg_total_loss,
             'teacher_accu': teacher_accu, 'stu_accu': stu_accu
@@ -584,7 +378,7 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
             for i,j in initial_joint_optimizer_lrs.items():
                 j *= 0.1**(args.epoch//40)
                 joint_optimizer_lrs[i] = j
-        elif args.dataset == 'Stanford_cars' or 'Stanford_dog':
+        elif args.dataset == 'Stanford_cars':
             initial_joint_optimizer_lrs =  {'features': 1e-4,'add_on_layers':  3e-3,'prototype_vectors': 3e-3}
             for i,j in initial_joint_optimizer_lrs.items():
                 j *= 0.1**(args.epoch//30)

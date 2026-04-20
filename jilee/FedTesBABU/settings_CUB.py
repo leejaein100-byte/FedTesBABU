@@ -6,9 +6,9 @@ parser = argparse.ArgumentParser()
 #parser.add_argument('--gpu_id', type=int, default=0, help="GPU ID, -1 for CPU")
 parser.add_argument('--arch',type=str, default='resnet50')
 parser.add_argument('--dataset',type=str, default='Stanford_dog')
-parser.add_argument('--SL_epochs',type=int, default=3)
+parser.add_argument('--SL_epochs',type=int, default=5)
 parser.add_argument('--warmup_ep',type=int, default=0)
-parser.add_argument('--fine_tune_epochs',type=int, default= 30)
+parser.add_argument('--fine_tune_epochs',type=int, default=30)
 parser.add_argument('--num_classes',type=int, default=120)
 parser.add_argument('--patch_num',type=int, default=3, help='1 or 3')
 parser.add_argument('--alpha',type=float, default=0.5)
@@ -37,12 +37,14 @@ parser.add_argument('--workers', default=8, type=int, metavar='N',
 parser.add_argument('--checkpoint-dir', default='./checkpoint/', type=Path, metavar='DIR', help='path to checkpoint directory')
 parser.add_argument('--num_train_epochs', type=int, default= 150)
 parser.add_argument('--seed', type=int, default= 42, help="SEED")
-parser.add_argument('--kd_epochs', type=int, default= 1, help="SEED")
+parser.add_argument('--kd_epochs', type=int, default= 3, help="SEED")
 parser.add_argument('--patch_div_loss',action='store_true', help = 'whether using score as a final logit')
 parser.add_argument('--ewc_lambda', type=float, default=0.0, help='EWC regularization strength (0=off)')
 parser.add_argument('--use_fisher', action='store_true', help='Use Fisher-weighted EWC (default: simple L2 anchor)')
-parser.add_argument('--reg_lambda', type=float, default=0.1, help='Anchor regularization strength: L2 for Euclidean params, projection metric for prototype_vectors (0=off)')
-parser.add_argument('--min_per_label', type=int, default= 0, help="SEED")
+parser.add_argument('--reg_lambda_eucl', type=float, default=0.1, help='L2 anchor strength for Euclidean params (features, add_on_layers, last_layer); 0=off')
+parser.add_argument('--reg_lambda_proj', type=float, default=0.01, help='Projection-metric anchor strength for prototype_vectors (Grassmann); 0=off')
+parser.add_argument('--min_per_label', type=int, default= 0, help="minimum number of image per each label")
+
 
 args = parser.parse_args()
 num_classes = args.num_classes
@@ -62,7 +64,7 @@ joint_lr_step_size = 5
 warm_optimizer_lrs = {'add_on_layers': 2e-4,
                       'prototype_vectors': 2e-4}
 
-last_layer_optimizer_lr = 1e-4
+last_layer_optimizer_lr = 1e-3
 
 
 coefs = {

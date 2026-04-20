@@ -28,29 +28,29 @@ def enhanced_training_with_bayesian_kd_server(args, clients, clients_state_list,
     """
     
     # Initialize Bayesian KD trainer with net_glob as the main object
-    #kd_trainer = BayesianKDTrainer(args, num_classes, net_glob, prototype_per_class, alpha=2.0, temp=4.0, kd_weight=0.7)
-    kd_trainer = BayesianKDTrainer(args, num_classes, net_glob, prototype_per_class, alpha=0.5, temp=args.temp, hyperparam = args.hyperparam)
-    # Phase 2: Create teacher models using Dirichlet distribution
-    #log(f'Epoch {epoch}: Creating teacher models with Dirichlet distribution')
+    kd_trainer = BayesianKDTrainer(
+        args, num_classes, net_glob, prototype_per_class,
+        alpha=0.5, temp=args.temp, hyperparam=args.hyperparam,
+        reg_lambda=getattr(args, 'reg_lambda', 0.0),
+    )
+    # Create teacher models using Dirichlet distribution
     teacher_models = kd_trainer.create_teacher_models_with_dirichlet(
         clients_state_list, clients, device, num_teachers=args.num_teachers,
     )
-    # Phase 1: Standard federated training on clients
-    for i in range(args.kd_epochs):
+    # Load server data once (moved outside the kd_epochs loop)
+    X_server, y_server = load_Stan_data(args, dataset, server_idx, 0, dict_users, private=False)
+    server_data = (X_server, y_server)
 
-        # Phase 3: Load server data for global model training
-        #log(f'Epoch {epoch}: Loading server data for global model training')
-        # Use server_idx as a placeholder - get server data 
-        X_server, y_server = load_Stan_data(args, dataset, server_idx, 0, dict_users, private=False)
-        server_data = (X_server, y_server)
-        
-        # Phase 4: Train net_glob with knowledge distillation using server data
-        #log(f'Epoch {epoch}: Training global model with knowledge distillation on server data')
+    # Save FedAvg anchor BEFORE any KD update.
+    # Uses plain L2 for Euclidean params and projection metric for prototype_vectors.
+    if getattr(args, 'reg_lambda', 0.0) > 0.0:
+        kd_trainer.save_anchor(device=device)
+
+    for i in range(args.kd_epochs):
         global_kd_results = kd_trainer.train_global_model_with_kd(
             teacher_models, server_data, device)
-        
+
         #log(f'Global KD training - Total Loss: {global_kd_results["average loss"]:.4f}')
-            #f'KD Loss: {global_kd_results["kd_loss"]:.4f}, CE Loss: {global_kd_results["ce_loss"]:.4f}')
     
     
     # Phase 5: Update clients by copying parameters from trained net_glob

@@ -30,17 +30,17 @@ def _train_or_test(args, client_idx, client_model, X_data, y_data, body_train, i
     client_model = client_model.cuda()
 
     if body_train:
-        if args.dataset == 'CUB' :
+        if args.dataset == 'CUB' or 'Stanford_dog':
             #initial_joint_optimizer_lrs =  {'features': 5e-5,'add_on_layers':  1e-3,'prototype_vectors': 1e-3}
             initial_joint_optimizer_lrs =  {'features': 1e-4,'add_on_layers':  3e-3,'prototype_vectors': 3e-3}
 
         else:
             initial_joint_optimizer_lrs = {'features': 1e-5,'add_on_layers':  2e-4,'prototype_vectors': 2e-4}
         
-        #joint_optimizer_lrs = {}
-        #for i,j in initial_joint_optimizer_lrs.items():
-        #    j *= 0.1**(args.epoch//40)
-        #    joint_optimizer_lrs[i] = j
+        joint_optimizer_lrs = {}
+        for i,j in initial_joint_optimizer_lrs.items():
+            j *= 0.1**(args.epoch//40)
+            joint_optimizer_lrs[i] = j
         joint_optimizer_lrs = initial_joint_optimizer_lrs
 
         optimizer_specs = beside_last(joint_optimizer_lrs, client_model)

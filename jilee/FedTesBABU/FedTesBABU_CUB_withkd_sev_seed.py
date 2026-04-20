@@ -1,14 +1,18 @@
 import torch.nn.functional as F
 import numpy as np
+from scipy.stats import mode
 import os
 import shutil
 import json
 import copy
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 import time
 from torch.utils.tensorboard import SummaryWriter
 from util.helpers import makedir
 from train_and_test_with_cluster_cost import *
 from util.log import create_logger
+from util.preprocess import mean, std, preprocess_input_function
 import settings_CUB
 #from utils.Fedtes_data_dist_img_augment import *
 from utils.Fedtes_data_dist import *
@@ -115,6 +119,7 @@ def save_settings(args, settings_dir):
     settings_dict = {
     'seed': args.seed,
     'iid': args.iid,
+    'num_channels': args.num_channels,
     'server_id_size': args.server_id_size,
     'local_bs': args.local_bs,
     'num_users': args.num_users,
@@ -123,14 +128,15 @@ def save_settings(args, settings_dir):
     'SL_epochs': args.SL_epochs,
     'fine_tune_epochs': args.fine_tune_epochs,
     'alpha': args.alpha,
+    'use_bbox': args.use_bbox,
     'temp': args.temp,
     'warmup_ep':args.warmup_ep,
     'hyperparam': args.hyperparam,
     'num_teachers': args.num_teachers,
     'patch_num': args.patch_num,
     'score logits':args.score_logit,
-    'Tscale': args.Tscale,
-    'kd_epochs': args.kd_epochs
+    'patch_div_loss': args.patch_div_loss,
+    'last layer':args.last_layer
     }
 
     # Save settings to JSON file
@@ -212,18 +218,28 @@ def enhanced_training_with_bayesian_kd_server(args, clients, clients_state_list,
         # Phase 3: Load server data for global model training
         #log(f'Epoch {epoch}: Loading server data for global model training')
         # Use server_idx as a placeholder - get server data 
-        X_server, y_server = load_data(args, dataset, server_idx, 0, dict_users, private=False)
+        X_server, y_server = load_Stan_data(args, dataset, server_idx, 0, dict_users, private=False)
         server_data = (X_server, y_server)
         
         # Phase 4: Train net_glob with knowledge distillation using server data
         #log(f'Epoch {epoch}: Training global model with knowledge distillation on server data')
         global_kd_results = kd_trainer.train_global_model_with_kd(
             teacher_models, server_data, device)
+        
+        #log(f'Global KD training - Total Loss: {global_kd_results["average loss"]:.4f}')
+            #f'KD Loss: {global_kd_results["kd_loss"]:.4f}, CE Loss: {global_kd_results["ce_loss"]:.4f}')
+    
+    
+    # Phase 5: Update clients by copying parameters from trained net_glob
+    #log(f'Epoch {epoch}: Updating clients from trained global model')
+    #clients = kd_trainer.update_clients_from_global(
+    #    clients, update_keys
+    #)
     
     log(f'Epoch {epoch}: Bayesian KD training completed with server-based global training')
     log(f'Global KD training results: {global_kd_results}')
     
-
+    #return global_kd_results, clients
     return  global_kd_results, kd_trainer.net_glob
 
 def main():
@@ -257,11 +273,11 @@ def main():
         args.seed = current_seed
         print(f"\n === Starting Trial {trial+1}/3 with Seed: {current_seed} === \n")
         start_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-        model_dir = './saved_models/' + dataset_name+'/' + base_architecture + '/' + str(args.iid) + '/'+str(start_time) + '/' + 'FedTesBABU_with_KD_Noncayley'
+        model_dir = './saved_models/' + dataset_name+'/' + base_architecture + '/'+ str(args.iid) + '/'+ str(start_time) + '/' + 'FedTesBABU NonCayleyT'
         if os.path.exists(model_dir) is True:
             shutil.rmtree(model_dir)
         makedir(model_dir)
-        log_directory = f"checkpoints/{str(args.iid)}/{str(dataset_name)}/'FedTesBABU_with_KD_NonCayley'/{start_time+'without augmented dataset'}/"
+        log_directory = f"checkpoints/{str(args.iid)}/'FedTesBABU NonCayleyT'/{start_time+'tuning with interval without augmented dataset'}/"
         writer = SummaryWriter(log_dir=log_directory)    
         shutil.copy(src=os.path.join(os.getcwd(), 'settings_CUB.py'), dst=model_dir)
         dict_users, server_idx, dataset=setup_datasets(args)
@@ -275,6 +291,7 @@ def main():
 
         update_keys = [k for k in net_glob.state_dict().keys() 
                       if 'linear' not in k and 'last_layer' not in k]
+        save_settings(args, model_dir)
         log, logclose = create_logger(log_filename=os.path.join(model_dir, 'train.log'))
         img_dir = os.path.join(model_dir, 'img')
         makedir(img_dir)
@@ -358,6 +375,13 @@ def main():
             net_glob.prototype_vectors.data = torch.cat(temp2, dim=0)     
             del temp1, temp2
 
+            # Test global model
+            global_test_results = local_test_global_model_proto(args, net_glob, X_test, y_test, coefs)  
+            writer.add_scalar('Global/Loss', global_test_results['average loss'], global_step=epoch)
+            writer.add_scalar('Global/Accuracy', global_test_results['accu'], global_step=epoch) 
+            log('Global model test')
+            log(global_test_results)
+            
             if epoch >= args.warmup_ep:
                 kd_return_dict, net_glob = enhanced_training_with_bayesian_kd_server(
                     args, clients, clients_state_list, net_glob, dict_users, server_idx, dataset, 
